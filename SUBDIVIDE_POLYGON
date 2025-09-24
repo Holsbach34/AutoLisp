@@ -1,0 +1,597 @@
+;;==========================================================================
+;; PROGRAMA DE SUBDIVISIÓN DE POLÍGONOS CON ANOTACIÓN
+;; Versión 2.0 - Optimizada
+;;==========================================================================
+
+;;--------------------------------------------------
+;; CONSTANTES GLOBALES
+;;--------------------------------------------------
+(setq PI 3.141592653589793)
+
+;;--------------------------------------------------
+;; FUNCIONES MATEMÁTICAS BÁSICAS
+;;--------------------------------------------------
+(defun acos (x)
+  (cond
+    ((< x -1.0) PI)
+    ((> x 1.0) 0.0)
+    ((equal x 1.0 1e-10) 0.0)
+    ((equal x -1.0 1e-10) PI)
+    (T (* 2.0 (atan (sqrt (/ (- 1.0 x) (+ 1.0 x))))))
+  )
+)
+
+(defun round-num (num dec)
+  (setq factor (expt 10 dec))
+  (/ (fix (+ (* num factor) 0.5)) factor)
+)
+
+;;--------------------------------------------------
+;; FUNCIONES DE MANIPULACIÓN DE LISTAS
+;;--------------------------------------------------
+(defun my-last (lst)
+  (if (cdr lst)
+      (my-last (cdr lst))
+      (car lst)
+  )
+)
+
+(defun my-subseq (lst start end)
+  (cond
+    ((or (null lst) (< start 0) (>= start end) (> end (length lst))) nil)
+    ((= start end) '())
+    (T (cons (nth start lst) (my-subseq lst (1+ start) end)))
+  )
+)
+
+(defun my-mod (a b)
+  (setq r (- a (* b (fix (/ a b)))))
+  (if (< r 0) (+ r b) r)
+)
+
+(defun safe-safearray->list (v)
+  (if (listp v) v (vlax-safearray->list v))
+)
+
+;;--------------------------------------------------
+;; FUNCIONES VECTORIALES
+;;--------------------------------------------------
+(defun vec-dot (v1 v2)
+  (+ (* (car v1) (car v2))
+     (* (cadr v1) (cadr v2)))
+)
+
+(defun vsub (v1 v2)
+  (list (- (car v1) (car v2))
+        (- (cadr v1) (cadr v2)))
+)
+
+(defun vadd (v1 v2)
+  (list (+ (car v1) (car v2))
+        (+ (cadr v1) (cadr v2)))
+)
+
+(defun vscale (v s)
+  (list (* (car v) s)
+        (* (cadr v) s))
+)
+
+(defun vnorm (v)
+  (setq mag (sqrt (+ (expt (car v) 2) (expt (cadr v) 2))))
+  (if (> mag 1e-8)
+      (list (/ (car v) mag) (/ (cadr v) mag))
+      v
+  )
+)
+
+(defun distance (p1 p2)
+  (sqrt (+ (expt (- (car p2) (car p1)) 2)
+           (expt (- (cadr p2) (cadr p1)) 2)))
+)
+
+(defun angle-between (p1 p2)
+  (atan (- (cadr p2) (cadr p1))
+        (- (car p2) (car p1)))
+)
+
+(defun midpoint (p1 p2)
+  (list (/ (+ (car p1) (car p2)) 2)
+        (/ (+ (cadr p1) (cadr p2)) 2))
+)
+
+;;--------------------------------------------------
+;; FUNCIONES PARA CÁLCULO DE ÁREAS Y CENTROIDES
+;;--------------------------------------------------
+(defun poly-area (pts)
+  (if (< (length pts) 3)
+      0.0
+      (round-num 
+        (abs (/ (apply '+
+                  (mapcar
+                    '(lambda (a b)
+                       (- (* (car a) (cadr b))
+                          (* (cadr a) (car b)))
+                     )
+                    pts
+                    (append (cdr pts) (list (car pts)))
+                  )
+                )
+                2.0))
+        20)
+  )
+)
+
+(defun polygon-centroid (pts)
+  (if (< (length pts) 3)
+      (if pts (midpoint (car pts) (if (cdr pts) (cadr pts) (car pts))) nil)
+      (progn
+        (setq A 0.0 cx 0.0 cy 0.0 n (length pts) i 0)
+        (while (< i n)
+          (setq p1 (nth i pts))
+          (setq p2 (nth (my-mod (+ i 1) n) pts))
+          (setq cross (- (* (car p1) (cadr p2))
+                         (* (car p2) (cadr p1))))
+          (setq A (+ A cross))
+          (setq cx (+ cx (* (+ (car p1) (car p2)) cross)))
+          (setq cy (+ cy (* (+ (cadr p1) (cadr p2)) cross)))
+          (setq i (1+ i))
+        )
+        (if (not (equal A 0.0 1e-6))
+          (list (/ cx (* 3.0 A)) (/ cy (* 3.0 A)))
+          (midpoint (car pts) (cadr pts))
+        )
+      )
+  )
+)
+
+;;--------------------------------------------------
+;; FUNCIONES PARA OPERACIONES CON LÍNEAS Y POLÍGONOS
+;;--------------------------------------------------
+(defun line-intersection (p1 p2 n C)
+  (setq dp (vsub p2 p1))
+  (setq denom (vec-dot n dp))
+  (if (not (equal denom 0.0 1e-10))
+      (progn
+        (setq t-value (/ (- C (vec-dot p1 n)) denom))
+        (if (and (>= t-value 0.0) (<= t-value 1.0))
+            (vadd p1 (vscale dp t-value))
+            nil
+        )
+      )
+      nil
+  )
+)
+
+;; Algoritmo de recorte de polígonos (Sutherland-Hodgman)
+(defun clip-poly (pts n C mode / newpts p1 p2 d1 d2 intpt tempPts)
+  (if (< (length pts) 3)
+      nil
+      (progn
+        (setq newpts '())
+        (setq tempPts (append pts (list (car pts)))) ; Cerrar el polígono temporalmente
+        (while (> (length tempPts) 1)
+          (setq p1 (car tempPts))
+          (setq p2 (cadr tempPts))
+          (setq tempPts (cdr tempPts))
+          (setq d1 (- (vec-dot p1 n) C))
+          (setq d2 (- (vec-dot p2 n) C))
+          
+          ;; Según el modo, se incluye p1 si cumple la condición
+          (if (if (eq mode 'inside) (<= d1 0.0) (>= d1 0.0))
+              (setq newpts (append newpts (list p1)))
+          )
+          
+          ;; Si hay cruce de frontera, calcular intersección
+          (if (< (* d1 d2) 0.0) ; Multiplicación negativa = signos diferentes = cruce
+              (progn
+                (setq intpt (line-intersection p1 p2 n C))
+                (if intpt (setq newpts (append newpts (list intpt))))
+              )
+          )
+        )
+        
+        ;; Eliminar duplicado si el polígono está cerrado
+        (if (and (> (length newpts) 0)
+                 (equal (car newpts) (my-last newpts)))
+            (setq newpts (my-subseq newpts 0 (1- (length newpts))))
+        )
+        newpts
+      )
+  )
+)
+
+(defun clip-poly-outside (pts n C)
+  (clip-poly pts n C 'outside)
+)
+
+;; Búsqueda binaria optimizada para encontrar el valor de C que da un área objetivo
+(defun binary-search-clip (pts n target / C_min C_max C_mid iter clipped area best_result best_diff)
+  (setq C_min (apply 'min (mapcar '(lambda (pt) (vec-dot pt n)) pts)))
+  (setq C_max (apply 'max (mapcar '(lambda (pt) (vec-dot pt n)) pts)))
+  (setq iter 0)
+  (setq best_result nil)
+  (setq best_diff 1e10) ; Inicializar con un valor grande
+  
+  (while (and (< iter 50) (> (abs (- C_max C_min)) 1e-6))
+    (setq C_mid (/ (+ C_min C_max) 2.0))
+    (setq clipped (clip-poly pts n C_mid 'inside))
+    
+    (if clipped
+        (progn
+          (setq area (poly-area clipped))
+          (setq curr_diff (abs (- area target)))
+          
+          ;; Guardar el mejor resultado encontrado hasta ahora
+          (if (< curr_diff best_diff)
+              (progn
+                (setq best_diff curr_diff)
+                (setq best_result clipped)
+              )
+          )
+          
+          ;; Criterio de parada anticipada si la precisión es suficiente
+          (if (< curr_diff 1e-4)
+              (setq iter 50) ; Forzar fin del bucle
+              (if (< area target)
+                  (setq C_min C_mid)
+                  (setq C_max C_mid)
+              )
+          )
+        )
+        (setq C_min C_mid)
+    )
+    (setq iter (1+ iter))
+  )
+  
+  ;; Retornar el mejor resultado o un último intento
+  (if best_result
+      best_result
+      (clip-poly pts n C_max 'inside))
+)
+
+(defun get-c-value (pts n)
+  (apply 'max (mapcar '(lambda (pt) (vec-dot pt n)) pts))
+)
+
+;;--------------------------------------------------
+;; FUNCIONES DE LIMPIEZA Y VALIDACIÓN
+;;--------------------------------------------------
+(defun clean-poly (pts / newPts tol i pt last)
+  (if (< (length pts) 3)
+      pts ; Retornar polígono original si es muy pequeño
+      (progn
+        (setq tol 1e-6)
+        (setq newPts (list (car pts)))
+        (setq i 1)
+        (while (< i (length pts))
+          (setq pt (nth i pts))
+          (setq last (my-last newPts))
+          (if (> (distance pt last) tol)
+              (setq newPts (append newPts (list pt)))
+          )
+          (setq i (1+ i))
+        )
+        
+        ;; Verificar si el último y primer punto son muy cercanos
+        (if (and (> (length newPts) 2)
+                 (< (distance (car newPts) (my-last newPts)) tol))
+            (setq newPts (butlast newPts))
+        )
+        
+        ;; Asegurar que hay suficientes puntos
+        (if (< (length newPts) 3)
+            pts ; Volver al original si falló la limpieza
+            newPts
+        )
+      )
+  )
+)
+
+;;--------------------------------------------------
+;; FUNCIONES DE DIBUJO Y ANOTACIÓN
+;;--------------------------------------------------
+(defun create-polyline (pts layer)
+  (entmakex
+    (append
+      (list
+        '(0 . "LWPOLYLINE")
+        '(100 . "AcDbEntity")
+        (cons 8 layer)
+        '(100 . "AcDbPolyline")
+        (cons 90 (length pts))
+        '(70 . 1) ; Polilínea cerrada
+      )
+      (mapcar '(lambda (pt) (cons 10 pt)) pts)
+    )
+  )
+  (entlast) ; Retornar la entidad creada
+)
+
+;; Función para formatear ángulos en formato sexagesimal: 00°00'00,00''
+(defun fmt-angle (ang / deg d m s sstr)
+  (setq deg (* ang (/ 180.0 PI))) ; Convertir a grados
+  (setq d (fix deg))
+  (setq m (fix (* (- deg d) 60)))
+  (setq s (* (- (* (- deg d) 60) m) 60))
+  
+  ;; Corrección para evitar "59'60,00" y redondearlo a 0 segundos
+  (if (>= s 59.995)
+    (progn
+      (setq s 0)
+      (setq m (1+ m))
+      (if (>= m 60)
+        (progn
+          (setq m 0)
+          (setq d (1+ d))
+        )
+      )
+    )
+  )
+  
+  (setq sstr (rtos s 2 2))
+  (setq sstr (vl-string-translate "." "," sstr))
+  (setq d (if (< d 10) (strcat "0" (itoa d)) (itoa d)))
+  (setq m (if (< m 10) (strcat "0" (itoa m)) (itoa m)))
+  (strcat d "°" m "'" sstr "''")
+)
+
+;; Función auxiliar para formatear números
+(defun fmt (num)
+  (rtos num 2 2)
+)
+
+;; Función para calcular ángulos de texto
+(defun text-rotation-angle (ang)
+  (if (and (> ang (/ PI 2.0)) (< ang (* PI 1.5)))
+      (+ ang PI)
+      ang)
+)
+
+;;--------------------------------------------------
+;; FUNCIÓN DE ANOTACIÓN DE POLÍGONOS
+;;--------------------------------------------------
+(defun lotedate (pts / ent data bulges cent txtHeight i num 
+                      p1 p2 b segLength segMid segAngle chord arcAngle 
+                      radius chordMid offsetDist chordAng perpAng vec dot 
+                      offset textPos areaVal n cx cy cross 
+                      textAngle rotAngle vInt v1 v2 bisector testVec angleTextPos 
+                      vertexTextAngle vertexTextAngleDeg internalAngle angleStr)
+  
+  ;; Verificar que el polígono tenga al menos 3 vértices
+  (if (< (length pts) 3)
+    (prompt "\nSe requieren al menos 3 vértices para formar un polígono.")
+    (progn
+      ;; Calcular área y centroide
+      (setq areaVal (poly-area pts))
+      (setq cent (polygon-centroid pts))
+      (setq txtHeight (getvar "textsize"))
+      
+      ;; Colocar texto de área en el centroide
+      (command "_TEXT" cent txtHeight 0 (strcat "Área: " (fmt (round-num areaVal 20)) " m²"))
+      
+      ;; Procesar cada lado para colocar su longitud
+      (setq num (length pts))
+      (setq i 0)
+      (while (< i num)
+        (setq p1 (nth i pts))
+        (setq p2 (nth (my-mod (+ i 1) num) pts))
+        
+        ;; Se asume que los vértices no tienen bulge (segmentos rectos)
+        (setq segLength (distance p1 p2))
+        (setq segMid (midpoint p1 p2))
+        (setq segAngle (angle-between p1 p2))
+        
+        ;; Calcular vector desde el punto medio hacia el centro (para texto interior)
+        (setq vInt (vnorm (vsub cent segMid)))
+        (setq offset (list (* (car vInt) (/ txtHeight 2.0))
+                         (* (cadr vInt) (/ txtHeight 2.0))))
+        (setq textPos (list (+ (car segMid) (car offset))
+                          (+ (cadr segMid) (cadr offset))))
+        (setq textAngle (text-rotation-angle segAngle))
+        (setq textAngleDeg (/ (* textAngle 180.0) PI))
+        (command "_TEXT" textPos txtHeight textAngleDeg (strcat (fmt segLength) " m"))
+        (setq i (1+ i))
+      )
+      
+      ;; Agregar anotación del ángulo interno en cada vértice
+      (setq i 0)
+      (while (< i num)
+        (setq p1 (nth (my-mod (- i 1) num) pts)) ; vértice anterior
+        (setq p2 (nth i pts))                    ; vértice actual
+        (setq p3 (nth (my-mod (+ i 1) num) pts)) ; vértice siguiente
+        
+        ;; Calcular vectores normalizados desde el vértice actual
+        (setq v1 (vnorm (vsub p1 p2)))
+        (setq v2 (vnorm (vsub p3 p2)))
+        
+        ;; Calcular el ángulo interno en p2
+        (setq internalAngle (acos (max -1.0 (min 1.0 (vec-dot v1 v2)))))
+        
+        ;; Calcular la bisectriz
+        (setq bisector (vnorm (vadd v1 v2)))
+        
+        ;; Asegurar que la bisectriz apunte hacia el interior
+        (setq testVec (vsub cent p2))
+        (if (< (vec-dot bisector testVec) 0)
+          (setq bisector (list (- (car bisector)) (- (cadr bisector)))))
+        
+        ;; Calcular la posición del texto del ángulo
+        (setq angleTextPos (list (+ (car p2) (* (car bisector) txtHeight))
+                               (+ (cadr p2) (* (cadr bisector) txtHeight))))
+        
+        ;; Definir la rotación del texto según la bisectriz
+        (setq vertexTextAngle (text-rotation-angle (atan (cadr bisector) (car bisector))))
+        (setq vertexTextAngleDeg (/ (* vertexTextAngle 180.0) PI))
+        
+        ;; Formatear el ángulo a notación sexagesimal
+        (setq angleStr (fmt-angle internalAngle))
+        (command "_TEXT" angleTextPos txtHeight vertexTextAngleDeg angleStr)
+        (setq i (1+ i))
+      )
+    )
+  )
+  (princ)
+)
+
+;;--------------------------------------------------
+;; COMANDO PRINCIPAL: SUBDIVIDE_POLYGON
+;;--------------------------------------------------
+(defun c:SUBDIVIDE_POLYGON ( / doc layer_name poly_ent coords pts num_div target_area 
+                               p1 p2 n current_poly clipped subdivPolys i 
+                               annotateChoice annotateFlag result coord_len)
+  (vl-load-com)
+  (setvar "CMDECHO" 0) ; Desactivar eco de comandos
+  
+  (setq doc (vla-get-activedocument (vlax-get-acad-object)))
+  (setq layer_name "SUBDIVISION")
+  
+  ;; Crear capa si no existe
+  (if (not (tblsearch "LAYER" layer_name))
+      (vla-add (vla-get-layers doc) layer_name)
+  )
+  
+  ;; Validar y procesar selección de polilínea
+  (setq poly_ent nil)
+  (prompt "\nSeleccione polilínea cerrada: ")
+  (setq result (entsel))
+  
+  (if result
+      (progn
+        (setq poly_ent (car result))
+        (setq ent_data (entget poly_ent))
+        
+        (if (and (wcmatch (cdr (assoc 0 ent_data)) "LWPOLYLINE,POLYLINE")
+                 (= (logand (cdr (assoc 70 ent_data)) 1) 1))
+            (progn
+              ;; Preguntar si se desean anotar los datos
+              (initget "Sí No S N")
+              (setq annotateChoice (getkword "\n¿Desea anotar los datos? [Sí/No] <Sí>: "))
+              
+              (if (or (null annotateChoice) 
+                      (eq annotateChoice "Sí") 
+                      (eq annotateChoice "S"))
+                  (setq annotateFlag T)
+                  (setq annotateFlag nil)
+              )
+              
+              ;; Obtener coordenadas y convertir a lista de puntos 2D
+              (setq coords (vlax-get (vlax-ename->vla-object poly_ent) 'Coordinates))
+              (setq coords (safe-safearray->list coords))
+              (setq pts '())
+              (setq i 0)
+              (setq coord_len (length coords))
+              
+              (while (< i coord_len)
+                (setq pts (append pts (list (list (nth i coords) (nth (+ i 1) coords)))))
+                (setq i (+ i 2))
+              )
+              
+              ;; Asegurar que la polilínea esté cerrada
+              (if (not (equal (car pts) (my-last pts) 1e-6))
+                  (setq pts (append pts (list (car pts))))
+              )
+              
+              ;; Validar y solicitar número de subdivisiones
+              (while (null num_div)
+                (setq input (getint "\nNúmero de subdivisiones: "))
+                (if (and input (> input 0))
+                    (setq num_div input)
+                    (prompt "\nEl número debe ser positivo.")
+                )
+              )
+              
+              (setq target_area (/ (poly-area pts) num_div))
+              (prompt (strcat "\nÁrea objetivo por subdivisión: " (fmt target_area) " m²"))
+              
+              ;; Solicitar línea de referencia para división
+              (setq p1 (getpoint "\nPrimer punto de referencia: "))
+              (while (null p1)
+                (setq p1 (getpoint "\nPrimer punto de referencia: "))
+              )
+              
+              (setq p2 (getpoint p1 "\nSegundo punto de referencia: "))
+              (while (null p2)
+                (setq p2 (getpoint p1 "\nSegundo punto de referencia: "))
+              )
+              
+              ;; Calcular vector normal a la línea de referencia
+              (setq n (vnorm (vsub p2 p1)))
+              (setq n (list (- (cadr n)) (car n))) ; Normal perpendicular
+              
+              ;; Iniciar proceso de subdivisión
+              (setq current_poly pts)
+              (setq subdivPolys '())
+              
+              (prompt "\nCalculando subdivisiones...")
+              (setvar "MODEMACRO" "Calculando subdivisiones...")
+              
+              ;; Bucle principal de subdivisión
+              (setq success T)
+              (repeat (1- num_div)
+                (if success
+                    (progn
+                      (setq clipped (binary-search-clip current_poly n target_area))
+                      (if (and clipped (>= (length clipped) 3))
+                          (progn
+                            (setq subdivPolys (append subdivPolys (list clipped)))
+                            (setq c-val (get-c-value clipped n))
+                            (setq current_poly (clip-poly-outside current_poly n c-val))
+                            
+                            ;; Verificar si el polígono resultante es válido
+                            (if (< (length current_poly) 3)
+                                (progn
+                                  (prompt "\nError: Una subdivisión generó un polígono inválido.")
+                                  (setq success nil)
+                                )
+                            )
+                          )
+                          (progn
+                            (prompt "\nError: No se pudo realizar la subdivisión correctamente.")
+                            (setq success nil)
+                          )
+                      )
+                    )
+                )
+              )
+              
+              ;; Agregar el último polígono
+              (if (and success (>= (length current_poly) 3))
+                  (setq subdivPolys (append subdivPolys (list current_poly)))
+              )
+              
+              (setvar "MODEMACRO" "")
+              
+              ;; Procesar y dibujar cada subdivisión
+              (if subdivPolys
+                  (progn
+                    (prompt (strcat "\nCreando " (itoa (length subdivPolys)) " subdivisiones..."))
+                    (foreach poly subdivPolys
+                      (setq clean_poly (clean-poly poly))
+                      (if (>= (length clean_poly) 3)
+                          (progn
+                            (setq ent (create-polyline clean_poly layer_name))
+                            (if annotateFlag 
+                                (lotedate clean_poly)
+                            )
+                          )
+                          (prompt "\nAdvertencia: Una subdivisión con menos de 3 vértices ha sido omitida.")
+                      )
+                    )
+                    (prompt "\nSubdivisión completada con éxito!")
+                  )
+                  (prompt "\nNo se pudieron crear subdivisiones válidas.")
+              )
+            )
+            (prompt "\nLa selección no es una polilínea cerrada válida.")
+        )
+      )
+      (prompt "\nNo se seleccionó ninguna entidad.")
+  )
+  
+  (setvar "CMDECHO" 1) ; Reactivar eco de comandos
+  (princ)
+)
+
+(princ "\nComando SUBDIVIDE_POLYGON cargado correctamente.")
+(princ "\nEscriba 'SUBDIVIDE_POLYGON' para iniciar la subdivisión de un polígono.")
+(princ)
